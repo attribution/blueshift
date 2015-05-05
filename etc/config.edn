@@ -1,0 +1,6 @@
+{:s3 {:credentials   {:access-key ""
+                      :secret-key ""}
+      :bucket        "blueshift-data"
+      :key-pattern   ".*"
+      :poll-interval {:seconds 30}}
+}

@@ -1,0 +1,1 @@
+watcher: lein run -- --s3id $S3_DATABASE_EXPORT_ID --s3key $S3_DATABASE_EXPORT_KEY --s3bucket $S3_DATABASE_EXPORT_BUCKET
