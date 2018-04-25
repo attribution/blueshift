@@ -4,7 +4,7 @@
             [clojure.tools.logging :refer (info error debug)]
             [clojure.string :as s]
             [com.stuartsierra.component :refer (system-map Lifecycle using)]
-            [clojure.core.async :refer (chan <!! >!! close! thread)]
+            [clojure.core.async :refer (chan <!! >!! close! thread timeout alts!!)]
             [uswitch.blueshift.util :refer (close-channels)]
             [metrics.meters :refer (mark! meter)]
             [metrics.counters :refer (inc! dec! counter)]
@@ -44,18 +44,23 @@
   [sql]
   (.prepareStatement *current-connection* sql))
 
+(def open-connections (counter [(str *ns*) "redshift-connections" "open-connections"]))
+
 (defmacro with-connection [jdbc-url & body]
   `(binding [*current-connection* (connection ~jdbc-url)]
-     (try ~@body
-          (debug "COMMIT")
-          (.commit *current-connection*)
-          (mark! redshift-import-commits)
+     (inc! open-connections)
+     (try (let [res# ~@body]
+            (debug "COMMIT")
+            (.commit *current-connection*)
+            (mark! redshift-import-commits)
+            res#)
           (catch SQLException e#
             (error e# "ROLLBACK")
             (mark! redshift-import-rollbacks)
             (.rollback *current-connection*)
             (throw e#))
           (finally
+            (dec! open-connections)
             (when-not (.isClosed *current-connection*)
               (.close *current-connection*))))))
 
@@ -124,35 +129,70 @@
       (clojure.string/replace #"aws_access_key_id=[^;]*" "aws_access_key_id=***")
       (clojure.string/replace #"aws_secret_access_key=[^;]*" "aws_secret_access_key=***")))
 
-(defn execute [& statements]
-  (doseq [statement statements]
-    (debug (aws-censor (.toString statement)))
-    (try (.execute statement)
-         (catch SQLException e
-           (error "Error executing statement:" (.toString statement))
-           (throw e)))))
+(def executing-statements (counter [(str *ns*) "redshift-connections" "executing-statements"]))
 
-(defn merge-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
+(defn- execute*
+  "Will return a map with error details if the statement fails"
+  [statement millis]
+  (try
+    (inc! executing-statements)
+    (.execute statement)
+    (dec! executing-statements)
+    nil
+    (catch SQLException e
+      (dec! executing-statements)
+      (error "error executing statement: " (.toString statement))
+      {:cause     :sql-exception
+       :statement (.toString statement)
+       :message   (.getMessage e)})))
+
+(def timeouts (meter [(str *ns*) "redshift-connections" "statement-timeouts"]))
+
+(defn execute
+  "Executes statements in the order specified. Will throw an exception if the statement
+   fails or the timeout is triggered."
+  [{:keys [timeout-millis] :or {timeout-millis (* 1000 60 5)}} & statements]
+  (loop [statements statements]
+    (when-let [statement (first statements)]
+      (let [result-ch (thread (execute* statement timeout-millis))
+            timeout-ch (timeout timeout-millis)
+            [v ch] (alts!! [result-ch timeout-ch])]
+        (cond (and (= ch result-ch)
+                   (not (nil? v)))  (throw (ex-info "error during execute" v))
+              (= ch timeout-ch) (do (println "timeout during statement,
+canceling")
+                                    (mark! timeouts)
+                                    (.cancel statement)
+                                    (throw (ex-info "timeout during execution"
+                                                    {:cause     :timeout
+                                                     :statement (.toString statement)
+                                                     :millis    timeout-millis})))
+              :else (recur (rest statements)))))))
+
+(defn merge-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy execute-opts] :as table-manifest}]
   (let [staging-table (str table "_staging")]
     (mark! redshift-imports)
     (with-connection jdbc-url
-      (execute (create-staging-table-stmt table staging-table)
+      (execute execute-opts
+               (create-staging-table-stmt table staging-table)
                (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
                (delete-target-stmt table staging-table pk-columns)
                (insert-from-staging-stmt table staging-table table-manifest)
                (drop-table-stmt staging-table)))))
 
-(defn replace-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
+(defn replace-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy execute-opts] :as table-manifest}]
   (mark! redshift-imports)
   (with-connection jdbc-url
-    (execute (truncate-table-stmt table)
+    (execute execute-opts
+             (truncate-table-stmt table)
              (copy-from-s3-stmt table redshift-manifest-url credentials table-manifest))))
 
-(defn append-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
+(defn append-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy execute-opts] :as table-manifest}]
   (let [staging-table (str table "_staging")]
     (mark! redshift-imports)
     (with-connection jdbc-url
-      (execute (create-staging-table-stmt table staging-table)
+      (execute execute-opts
+               (create-staging-table-stmt table staging-table)
                (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
                (append-from-staging-stmt table staging-table pk-columns)
                (drop-table-stmt staging-table)))))

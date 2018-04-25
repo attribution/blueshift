@@ -1,0 +1,18 @@
+pipeline:
+  test:
+    image: clojure
+    commands:
+      - lein test
+
+  build:
+    image: clojure
+    commands:
+      - lein uberjar
+      - git clone git://github.com/uswitch/blueshift-statsd-metrics.git metrics
+      - cd metrics && lein uberjar && cp -pr target/blueshift-statsd-metrics-0.1.0-SNAPSHOT-standalone.jar ../target/blueshift-statsd-metrics.jar
+
+  docker:
+    image: plugins/docker
+    repo: uswitch/blueshift
+    tags:
+      - "${DRONE_COMMIT_SHA:0:8}"
